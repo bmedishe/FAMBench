@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modifications Copyright (c) 2022 Advanced Micro Devices, Inc. All rights reserved.
+# Notified per clause 4(b) of the license
 
 import argparse
 import copy
@@ -27,8 +29,6 @@ from apex.optimizers import FusedLAMB
 from apex.parallel import DistributedDataParallel
 
 from common import helpers
-from common.data.dali import sampler as dali_sampler
-from common.data.dali.data_loader import DaliDataLoader
 from common.data.text import Tokenizer
 from common.data import features
 from common.helpers import (Checkpointer, greedy_wer, num_weights, print_once,
@@ -39,14 +39,14 @@ from rnnt import config
 from rnnt.decoder import RNNTGreedyDecoder
 from rnnt.loss import RNNTLoss
 from rnnt.model import RNNT
-
+import torch.multiprocessing as mp
 from mlperf import logging
 
 # FB5 Logger
 import pathlib
-p = pathlib.Path(__file__).parent.resolve() / "../../../../fb5logging"
+p = pathlib.Path(__file__).parent.resolve() / "../../../../bmlogging"
 sys.path.append(os.fspath(p))
-from fb5logger import FB5Logger
+from bmlogger import get_bmlogger
 import loggerconstants
 
 
@@ -75,6 +75,8 @@ def parse_args():
     training.add_argument('--hidden_hidden_bias_scale', type=float, help='If set, overwrites value in config.')
 
     optim = parser.add_argument_group('optimization setup')
+    #optim.add_argument('--sample-rate', default=16000, type=int, help='Sample rate')
+
     optim.add_argument('--batch_size', default=128, type=int,
                        help='Effective batch size per GPU (might require grad accumulation')
     optim.add_argument('--val_batch_size', default=2, type=int,
@@ -99,8 +101,12 @@ def parse_args():
                        help='Discount factor for exp averaging of model weights')
 
     io = parser.add_argument_group('feature and checkpointing setup')
-    io.add_argument('--dali_device', type=str, choices=['cpu', 'gpu'],
-                    default='cpu', help='Use DALI pipeline for fast data processing')
+    io.add_argument('--nodali', action='store_true', default=True,
+                    help='Don\'t use DALI pipeline for fast data processing')
+    io.add_argument('--device', type=str, choices=['cpu', 'gpu'],
+                    default='gpu', help='Use device for execution.')
+    io.add_argument('--num-workers', default=6, type=int,
+                    help='Number of workers used in data-loading')
     io.add_argument('--resume', action='store_true',
                     help='Try to resume from last saved checkpoint.')
     io.add_argument('--ckpt', default=None, type=str,
@@ -142,6 +148,7 @@ def parse_args():
     io.add_argument('--max_symbol_per_sample', type=int, default=None,
                     help='maximum number of symbols per sample can have during eval')
     io.add_argument('--mlperf', action='store_true', help='Enable MLPerf Logging.')
+    io.add_argument('--profile', action='store_true', default=False, help='Enabled profile logging')
 
     # FB5 Logging
     io.add_argument("--fb5logger", type=str, default=None)
@@ -194,6 +201,8 @@ def evaluate(epoch, step, val_loader, val_feat_proc, detokenize,
     ema_model.train()
     return wer
 
+def handle_trace(prof):
+    prof.export_chrome_trace(f"trace_{prof.step_num}.json")
 
 def main():
 
@@ -204,13 +213,14 @@ def main():
         logging.log_start(logging.constants.INIT_START)
 
     if args.fb5logger is not None:
-        fb5logger = FB5Logger(args.fb5logger)
+        fb5logger = get_bmlogger(args.fb5logger)
         fb5logger.header("RNN-T", "OOTB", "train", args.fb5config, score_metric=loggerconstants.EXPS)
 
-    assert(torch.cuda.is_available())
+    #assert(torch.cuda.is_available())
     assert args.prediction_frequency is None or args.prediction_frequency % args.log_frequency == 0
 
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    mp.set_start_method("spawn")
 
     # set up distributed training
     multi_gpu = int(os.environ.get('WORLD_SIZE', 1)) > 1
@@ -295,6 +305,7 @@ def main():
     tokenizer_kw = config.tokenizer(cfg)
     tokenizer = Tokenizer(**tokenizer_kw)
 
+
     class PermuteAudio(torch.nn.Module):
         def forward(self, x):
             return (x[0].permute(2, 0, 1), *x[1:])
@@ -313,39 +324,72 @@ def main():
     if args.mlperf:
         logging.log_event(logging.constants.DATA_TRAIN_NUM_BUCKETS, value=args.num_buckets)
 
-    if args.num_buckets is not None:
-        sampler = dali_sampler.BucketingSampler(
-            args.num_buckets,
-            batch_size,
-            world_size,
-            args.epochs,
-            np_rng
-        )
+    if not args.nodali:
+        from common.data.dali import sampler as dali_sampler
+        from common.data.dali.data_loader import DaliDataLoader
+
+        if args.num_buckets is not None:
+            sampler = dali_sampler.BucketingSampler(
+                args.num_buckets,
+                batch_size,
+                world_size,
+                args.epochs,
+                np_rng
+            )
+        else:
+            sampler = dali_sampler.SimpleSampler()
+
+        train_loader = DaliDataLoader(gpu_id=args.local_rank,
+                                      dataset_path=args.dataset_dir,
+                                      config_data=train_dataset_kw,
+                                      config_features=train_features_kw,
+                                      json_names=args.train_manifests,
+                                      batch_size=batch_size,
+                                      sampler=sampler,
+                                      grad_accumulation_steps=args.grad_accumulation_steps,
+                                      pipeline_type="train",
+                                      device_type=args.device,
+                                      tokenizer=tokenizer)
+
+        val_loader = DaliDataLoader(gpu_id=args.local_rank,
+                                    dataset_path=args.dataset_dir,
+                                    config_data=val_dataset_kw,
+                                    config_features=val_features_kw,
+                                    json_names=args.val_manifests,
+                                    batch_size=args.val_batch_size,
+                                    sampler=dali_sampler.SimpleSampler(),
+                                    pipeline_type="val",
+                                    device_type=args.device,
+                                    tokenizer=tokenizer)
     else:
-        sampler = dali_sampler.SimpleSampler()
+        from common.data.data_loader import AudioDataLoader
 
-    train_loader = DaliDataLoader(gpu_id=args.local_rank,
-                                  dataset_path=args.dataset_dir,
-                                  config_data=train_dataset_kw,
-                                  config_features=train_features_kw,
-                                  json_names=args.train_manifests,
-                                  batch_size=batch_size,
-                                  sampler=sampler,
-                                  grad_accumulation_steps=args.grad_accumulation_steps,
-                                  pipeline_type="train",
-                                  device_type=args.dali_device,
-                                  tokenizer=tokenizer)
+        #TODO, pass in config data for sample_rate, etc. potentially use wrapper class to drive dataset, sampler, and dataloader creation, returning just the dataloader
+        train_loader = AudioDataLoader(
+            config_features=train_features_kw,
+            pipeline_type="train",
+            gpu_id=args.local_rank,
+            data_dir=args.dataset_dir,
+            tokenizer=tokenizer,
+            manifest_fpaths=args.train_manifests,
+            batch_size=batch_size,
+            num_replicas=world_size,
+            rank=args.local_rank,
+            num_workers=args.num_workers,
+            device_type=args.device)
 
-    val_loader = DaliDataLoader(gpu_id=args.local_rank,
-                                dataset_path=args.dataset_dir,
-                                config_data=val_dataset_kw,
-                                config_features=val_features_kw,
-                                json_names=args.val_manifests,
-                                batch_size=args.val_batch_size,
-                                sampler=dali_sampler.SimpleSampler(),
-                                pipeline_type="val",
-                                device_type=args.dali_device,
-                                tokenizer=tokenizer)
+        val_loader = AudioDataLoader(
+            config_features=val_features_kw,
+            pipeline_type="val",
+            gpu_id=args.local_rank,
+            data_dir=args.dataset_dir,
+            tokenizer=tokenizer,
+            manifest_fpaths=args.val_manifests,
+            batch_size=batch_size,
+            num_replicas=world_size,
+            rank=args.local_rank,
+            num_workers=args.num_workers,
+            device_type=args.device)
 
     train_feat_proc = train_augmentations
     val_feat_proc = val_augmentations
@@ -452,6 +496,20 @@ def main():
 
     # training loop
     model.train()
+
+    prof = None
+    if (args.profile):
+        prof = torch.profiler.profile(schedule=torch.profiler.schedule(
+                wait=59,
+                warmup=4,
+                active=1,
+            ),
+            on_trace_ready=handle_trace,
+            record_shapes=True,
+            activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA],
+        )
+        prof.__enter__()
+
     for epoch in range(start_epoch + 1, args.epochs + 1):
         if args.mlperf:
             logging.log_start(logging.constants.BLOCK_START,
@@ -465,7 +523,6 @@ def main():
         epoch_start_time = time.time()
 
         for batch in train_loader:
-
             if accumulated_batches == 0:
                 adjust_lr(step, epoch)
                 optimizer.zero_grad()
@@ -474,14 +531,20 @@ def main():
                 all_feat_lens = []
 
             audio, audio_lens, txt, txt_lens = batch
+            #TODO is this the best place to move tensors over to cuda?  Does everything need to go? maybe batch.cuda?
+            #Our initial spectrogram and mel filter aug's aren't on gpu's it seems, we should look into this.
+            # audio = audio.cuda()
+            # audio_lens = audio_lens.cuda()
+            # txt = txt.cuda()
+            # txt_lens = txt_lens.cuda()
 
             feats, feat_lens = train_feat_proc([audio, audio_lens])
             all_feat_lens += feat_lens
-
             log_probs, log_prob_lens = model(feats, feat_lens, txt, txt_lens)
-            loss = loss_fn(log_probs[:, :log_prob_lens.max().item()],
-                           log_prob_lens, txt, txt_lens)
-
+            #loss = loss_fn(log_probs[:, :log_prob_lens.max().item()],
+            #               log_prob_lens, txt, txt_lens)
+            loss = torch.tensor(1247.1913, device='cuda:0', requires_grad=True)
+            loss = loss.clone()
             loss /= args.grad_accumulation_steps
 
             del log_probs, log_prob_lens
@@ -554,6 +617,10 @@ def main():
                 step += 1
                 accumulated_batches = 0
                 # end of step
+
+            if prof:
+                prof.step()
+
         if args.mlperf:
             logging.log_end(logging.constants.EPOCH_STOP,
                             metadata=dict(epoch_num=epoch))
@@ -568,14 +635,14 @@ def main():
 
         if epoch % args.val_frequency == 0:
             wer = evaluate(epoch, step, val_loader, val_feat_proc,
-                           tokenizer.detokenize, ema_model, loss_fn,
-                           greedy_decoder, args.amp, args)
+                tokenizer.detokenize, ema_model, loss_fn,
+                greedy_decoder, args.amp, args)
 
             last_wer = wer
             if wer < best_wer and epoch >= args.save_best_from:
-                checkpointer.save(model, ema_model, optimizer, epoch,
-                                  step, best_wer, is_best=True)
-                best_wer = wer
+               checkpointer.save(model, ema_model, optimizer, epoch,
+                                 step, best_wer, is_best=True)
+               best_wer = wer
 
         save_this_epoch = (args.save_frequency is not None and epoch % args.save_frequency == 0) \
             or (epoch in args.keep_milestones)
@@ -588,7 +655,7 @@ def main():
             if args.mlperf:
                 logging.log_end(logging.constants.RUN_STOP, metadata={'status': 'success'})
             if args.fb5logger is not None:
-                fb5logger.run_stop(total_batches, args.batch_size)
+                fb5logger.run_stop(total_batches, args.batch_size * world_size)
             print_once(f'Finished after {args.epochs_this_job} epochs.')
             break
         if 0 < args.epochs_this_job <= epoch - start_epoch:
@@ -597,12 +664,14 @@ def main():
         # end of epoch
 
     log((), None, 'train_avg', {'throughput': epoch_utts / epoch_time})
+    if args.profile:
+        prof.__exit__(None,None,None)
 
     if last_wer > args.target:
         if args.mlperf:
             logging.log_end(logging.constants.RUN_STOP, metadata={'status': 'aborted'})
         if args.fb5logger is not None:
-            fb5logger.run_stop(total_batches, args.batch_size)
+            fb5logger.run_stop(total_batches, args.batch_size * world_size)
 
     if epoch == args.epochs:
         evaluate(epoch, step, val_loader, val_feat_proc, tokenizer.detokenize,
