@@ -256,6 +256,8 @@ def label_collate(labels):
     Returns:
         A padded torch.Tensor of shape (batch, max_seq_len).
     """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    labels = labels.to(device)
 
     if isinstance(labels, torch.Tensor):
         return labels.type(torch.int64)
